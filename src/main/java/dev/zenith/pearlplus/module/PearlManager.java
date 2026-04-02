@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
 
@@ -330,6 +331,39 @@ public class PearlManager {
             suffix++;
         }
         return null;
+    }
+
+    /**
+     * Removes all pearl entries for players whose UUID is not in the authorized set.
+     * Called after a ledger sync to clean out pearls from deauthorized users.
+     *
+     * @param authorizedUUIDs the set of MC UUIDs currently authorized
+     * @return the number of player entries purged
+     */
+    public int purgeUnauthorized(Set<UUID> authorizedUUIDs) {
+        if (authorizedUUIDs == null || authorizedUUIDs.isEmpty()) {
+            return 0;
+        }
+
+        List<UUID> toPurge = new ArrayList<>();
+        for (UUID uuid : PLUGIN_CONFIG.players.keySet()) {
+            if (!authorizedUUIDs.contains(uuid)) {
+                toPurge.add(uuid);
+            }
+        }
+
+        for (UUID uuid : toPurge) {
+            PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.remove(uuid);
+            if (entry != null) {
+                int pearlCount = entry.pearls != null ? entry.pearls.size() : 0;
+                info(String.format("Purged %d pearl(s) for unauthorized user %s (%s)",
+                        pearlCount,
+                        entry.playerName != null ? entry.playerName : "unknown",
+                        uuid));
+            }
+        }
+
+        return toPurge.size();
     }
 
     public void info(String message) {

@@ -7,11 +7,14 @@ import com.rabbitmq.client.*;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.module.api.Module;
 import dev.zenith.pearlplus.PearlPlusConfig;
+import dev.zenith.pearlplus.PearlPlusPlugin;
 import dev.zenith.pearlplus.module.PearlManager;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -97,6 +100,8 @@ public class HydraIntegration extends Module {
 
     // Load requests flow: RabbitMQ consumer thread → queue → game tick thread.
     private final LinkedBlockingQueue<PearlLoadRequest> pendingLoads = new LinkedBlockingQueue<>();
+    // Ledger updates flow: RabbitMQ consumer thread → queue → game tick thread (purge must run on game thread).
+    private final LinkedBlockingQueue<List<HydraLedger.LedgerEntry>> pendingLedgerUpdates = new LinkedBlockingQueue<>();
 
     private volatile Connection rabbitConn;
     private volatile Channel    publishCh;
@@ -177,6 +182,21 @@ public class HydraIntegration extends Module {
             JsonObject msg  = JsonParser.parseString(raw).getAsJsonObject();
             String type     = msg.has("type") ? msg.get("type").getAsString() : "";
 
+            if ("PEARL_INVENTORY".equals(type)) {
+                handlePearlInventory(msg);
+                return;
+            }
+
+            if ("PEARL_SYNC_LEDGER".equals(type)) {
+                handlePearlSyncLedger(msg);
+                return;
+            }
+
+            if ("PEARL_CLEAR".equals(type)) {
+                handlePearlClear(msg);
+                return;
+            }
+
             if (!"PEARL_LOAD".equals(type)) return; // not our command
 
             String commandId  = msg.has("commandId") ? msg.get("commandId").getAsString() : "";
@@ -209,10 +229,27 @@ public class HydraIntegration extends Module {
 
     private void onGameTick(ClientBotTick event) {
         if (!hydraActive) return;
+
+        // Process ledger updates first — purge must complete before any loads.
+        List<HydraLedger.LedgerEntry> ledgerUpdate;
+        while ((ledgerUpdate = pendingLedgerUpdates.poll()) != null) {
+            processLedgerUpdate(ledgerUpdate);
+        }
+
         PearlLoadRequest req;
         while ((req = pendingLoads.poll()) != null) {
             processPearlLoad(req);
         }
+    }
+
+    /**
+     * Applies a ledger update: replaces the authorized user list.
+     * Purge of unauthorized pearls is currently disabled — all players'
+     * pearls are respected regardless of ledger membership.
+     * Runs on the game thread — safe to modify PLUGIN_CONFIG.
+     */
+    private void processLedgerUpdate(List<HydraLedger.LedgerEntry> entries) {
+        PearlPlusPlugin.LEDGER.update(entries);
     }
 
     /**
@@ -313,6 +350,163 @@ public class HydraIntegration extends Module {
             );
         } catch (IOException e) {
             LOG.warn("[Hydra] Failed to publish agent.pearl.load result: {}", e.getMessage());
+        }
+    }
+
+    // ── PEARL_INVENTORY handler (runs on RabbitMQ consumer thread — read-only) ─
+
+    /**
+     * Handles {@code PEARL_INVENTORY} commands by reading all players from
+     * {@code PLUGIN_CONFIG.players} and publishing an {@code agent.pearl.inventory}
+     * event with the full pearl roster.
+     *
+     * <p>This is safe to run on the consumer thread because it only reads the
+     * config map — no Baritone or entity-cache interaction required.
+     */
+    private void handlePearlInventory(JsonObject msg) {
+        String commandId = msg.has("commandId") ? msg.get("commandId").getAsString() : "";
+
+        JsonObject data = new JsonObject();
+        data.addProperty("commandId", commandId);
+
+        com.google.gson.JsonArray playersArr = new com.google.gson.JsonArray();
+        for (var entry : PLUGIN_CONFIG.players.entrySet()) {
+            UUID uuid = entry.getKey();
+            PearlPlusConfig.PlayerPearls pp = entry.getValue();
+
+            JsonObject playerObj = new JsonObject();
+            playerObj.addProperty("uuid", uuid.toString());
+            playerObj.addProperty("name", pp.playerName != null ? pp.playerName : "");
+            playerObj.addProperty("pearlCount", pp.pearls.size());
+
+            com.google.gson.JsonArray pearlIds = new com.google.gson.JsonArray();
+            for (String id : pp.pearls.keySet()) {
+                pearlIds.add(id);
+            }
+            playerObj.add("pearlIds", pearlIds);
+
+            playersArr.add(playerObj);
+        }
+        data.add("players", playersArr);
+
+        // Publish agent.pearl.inventory event
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.inventory");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", data);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.inventory";
+        byte[] body = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish agent.pearl.inventory: {}", e.getMessage());
+        }
+    }
+
+    // ── PEARL_SYNC_LEDGER handler (runs on RabbitMQ consumer thread — parse only) ─
+
+    /**
+     * Parses a {@code PEARL_SYNC_LEDGER} command and enqueues the entries for
+     * processing on the game tick thread (where PLUGIN_CONFIG can be safely modified).
+     *
+     * <p>Inbound payload:
+     * <pre>{@code
+     * {
+     *   "type": "PEARL_SYNC_LEDGER",
+     *   "commandId": "<uuid>",
+     *   "data": {
+     *     "users": [
+     *       {"uuid": "<mc-uuid>", "name": "<mc-name>", "rank": "intern"},
+     *       {"uuid": "<mc-uuid>", "name": "<mc-name>", "rank": "guest"}
+     *     ]
+     *   }
+     * }
+     * }</pre>
+     */
+    private void handlePearlSyncLedger(JsonObject msg) {
+        JsonObject data = msg.has("data") ? msg.getAsJsonObject("data") : new JsonObject();
+        com.google.gson.JsonArray usersArr = data.has("users") ? data.getAsJsonArray("users") : new com.google.gson.JsonArray();
+
+        List<HydraLedger.LedgerEntry> entries = new ArrayList<>();
+        for (var element : usersArr) {
+            if (!element.isJsonObject()) continue;
+            JsonObject userObj = element.getAsJsonObject();
+
+            String uuidStr = userObj.has("uuid") ? userObj.get("uuid").getAsString() : null;
+            String name = userObj.has("name") ? userObj.get("name").getAsString() : "";
+            String rank = userObj.has("rank") ? userObj.get("rank").getAsString() : "";
+
+            if (uuidStr == null || uuidStr.isBlank()) continue;
+            try {
+                UUID uuid = UUID.fromString(uuidStr);
+                entries.add(new HydraLedger.LedgerEntry(uuid, name, rank));
+            } catch (IllegalArgumentException e) {
+                LOG.warn("[Hydra] Skipping invalid UUID in ledger: {}", uuidStr);
+            }
+        }
+
+        LOG.info("[Hydra] Received PEARL_SYNC_LEDGER with {} user(s), queuing for game thread", entries.size());
+        pendingLedgerUpdates.add(entries);
+    }
+
+    // ── PEARL_CLEAR handler ──────────────────────────────────────────────────────
+
+    /**
+     * Handles {@code PEARL_CLEAR} commands by removing all stored pearl data.
+     * Sent by the C2 when an agent is unassigned from a base or the base is
+     * removed — prevents the bot from pathfinding millions of blocks to old
+     * pearl locations.
+     *
+     * <p>Publishes an {@code agent.pearl.clear} acknowledgement event.
+     */
+    private void handlePearlClear(JsonObject msg) {
+        String commandId = msg.has("commandId") ? msg.get("commandId").getAsString() : "";
+
+        int count = PLUGIN_CONFIG.players.size();
+        PLUGIN_CONFIG.players.clear();
+        if (PearlPlusPlugin.AUTO_DETECT != null) {
+            PearlPlusPlugin.AUTO_DETECT.resetTracking();
+        }
+        LOG.info("[Hydra] PEARL_CLEAR: removed all pearl data ({} player entries)", count);
+
+        // Publish acknowledgement
+        JsonObject data = new JsonObject();
+        data.addProperty("commandId", commandId);
+        data.addProperty("status", "cleared");
+        data.addProperty("playersCleared", count);
+
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.clear");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", data);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.clear";
+        byte[] body = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish agent.pearl.clear: {}", e.getMessage());
         }
     }
 

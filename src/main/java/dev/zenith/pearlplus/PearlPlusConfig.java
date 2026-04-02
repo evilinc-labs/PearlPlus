@@ -27,7 +27,7 @@ public class PearlPlusConfig {
     public static final class AutoDetectConfig {
         public boolean enabled = true;
         public boolean temporaryMode = false;
-        public boolean distanceCheck = false;
+        public boolean distanceCheck = true;
         public int temporaryRemovalRange = 32; //blocks
     }
 

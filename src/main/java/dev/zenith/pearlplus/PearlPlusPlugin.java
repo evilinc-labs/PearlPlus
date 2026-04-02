@@ -6,6 +6,7 @@ import com.zenith.plugin.api.ZenithProxyPlugin;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 import dev.zenith.pearlplus.command.*;
 import dev.zenith.pearlplus.hydra.HydraIntegration;
+import dev.zenith.pearlplus.hydra.HydraLedger;
 import dev.zenith.pearlplus.module.*;
 
 @Plugin(
@@ -21,6 +22,8 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
     public static PluginAPI API;
     public static PearlPlusConfig PLUGIN_CONFIG;
     public static ComponentLogger LOG;
+    public static final HydraLedger LEDGER = new HydraLedger();
+    public static AutoDetectModule AUTO_DETECT;
 
     @Override
     public void onLoad(PluginAPI pluginAPI) {
@@ -30,7 +33,8 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
         PLUGIN_CONFIG = API.registerConfig(BuildConstants.PLUGIN_ID, PearlPlusConfig.class);
         API.registerCommand(new PearlPlusCommand());
         API.registerModule(new AutoLoadModule());
-        API.registerModule(new AutoDetectModule());
+        AUTO_DETECT = new AutoDetectModule();
+        API.registerModule(AUTO_DETECT);
 
         // Optional Hydra C2 integration — activates only when HYDRA_RABBIT_URL and
         // HYDRA_AGENT_ID env vars are present. No-ops silently on standalone deployments.

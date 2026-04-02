@@ -8,6 +8,7 @@ import com.zenith.command.api.CommandUsage;
 import com.zenith.discord.Embed;
 import com.zenith.feature.api.minetools.MinetoolsApi;
 import com.zenith.feature.api.minetools.model.MinetoolsUuidResponse;
+import dev.zenith.pearlplus.PearlPlusPlugin;
 import dev.zenith.pearlplus.module.AutoLoadModule;
 import dev.zenith.pearlplus.module.AutoDetectModule;
 import dev.zenith.pearlplus.module.PearlManager;
@@ -80,6 +81,9 @@ public class PearlPlusCommand extends Command {
                             .mapToInt(playerPearls -> playerPearls.pearls.size())
                             .sum();
                     PLUGIN_CONFIG.players.clear();
+                    if (PearlPlusPlugin.AUTO_DETECT != null) {
+                        PearlPlusPlugin.AUTO_DETECT.resetTracking();
+                    }
                     c.getSource().getEmbed()
                             .title("Cleared pearls (" + pearlCount + " pearls removed from " + playerCount + " players)");
                     LOG.info("Cleared pearls ({} pearls removed from {} players)", pearlCount, playerCount);

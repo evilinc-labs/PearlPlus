@@ -16,6 +16,7 @@ import java.util.*;
 
 import static com.zenith.Globals.*;
 import static com.github.rfresh2.EventConsumer.of;
+import static dev.zenith.pearlplus.PearlPlusPlugin.LEDGER;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class AutoDetectModule extends Module {
@@ -23,11 +24,14 @@ public class AutoDetectModule extends Module {
     private static final long STORED_PEARL_REMOVAL_GRACE_MS = 60_000L;
     private static final int POSITION_HISTORY_LIMIT = 8;
 
+    private static final long POST_CLEAR_SUPPRESS_MS = 10_000L;
+
     private final Map<Integer, TrackedPearl> trackedPearls = new HashMap<>();
     private final PearlManager pearlManager = new PearlManager(this);
     private final Set<Column> acknowledgedColumns = new HashSet<>();
     private boolean pendingReconnectGrace = false;
     private long suppressStoredPearlRemovalUntil = 0L;
+    private long suppressRegistrationUntil = 0L;
 
     @Override
     public boolean enabledSetting() {
@@ -59,7 +63,24 @@ public class AutoDetectModule extends Module {
     @Override
     public void onDisable() {
         trackedPearls.clear();
+        acknowledgedColumns.clear();
         pendingReconnectGrace = false;
+    }
+
+    /**
+     * Resets all tracking state and suppresses auto-registration for 10 seconds.
+     * Called after {@code pp list clear} / {@code PEARL_CLEAR} so existing pearl
+     * entities in the stasis chambers aren't immediately re-registered to whoever
+     * happens to be standing nearby.
+     *
+     * After the suppression window, only freshly-thrown pearls will be registered.
+     * Existing pearls from before the clear are forgotten.
+     */
+    public void resetTracking() {
+        trackedPearls.clear();
+        acknowledgedColumns.clear();
+        suppressRegistrationUntil = System.currentTimeMillis() + POST_CLEAR_SUPPRESS_MS;
+        info("Detection state reset — registration suppressed for 10s");
     }
 
     public boolean isTemporaryModeEnabled() {
@@ -207,6 +228,9 @@ public class AutoDetectModule extends Module {
     }
 
     private void attemptAutoRegistration(long now) {
+        if (now < suppressRegistrationUntil) {
+            return;
+        }
         for (TrackedPearl tracked : trackedPearls.values()) {
             if (!tracked.ownerHasName() || tracked.owner().uuid() == null) {
                 if (!tracked.waitingForNameLogged()) {
@@ -216,6 +240,19 @@ public class AutoDetectModule extends Module {
                 continue;
             } else {
                 tracked.clearWaitingForNameLog();
+            }
+
+            // Hydra authorization check: reject pearls from users not in the ledger.
+            // In standalone mode (no ledger received), all users pass.
+            if (!LEDGER.isAuthorized(tracked.owner().uuid())) {
+                if (!tracked.unauthorizedLogged()) {
+                    info(String.format(
+                            "Ignoring pearl from unauthorized user %s — not in Hydra ledger",
+                            tracked.ownerSummary()
+                    ));
+                    tracked.markUnauthorizedLogged();
+                }
+                continue;
             }
 
             if (!tracked.isStable(now)) {
@@ -394,9 +431,11 @@ public class AutoDetectModule extends Module {
 
     private Optional<OwnerInfo> resolveOwnerInfo(Entity pearl, Map<Integer, Entity> entities) {
         Optional<OwnerInfo> resolved = resolveOwnerFromProjectileOwner(pearl, entities);
-        if (resolved.isPresent() || !PLUGIN_CONFIG.autoDetect.distanceCheck) {
+        if (resolved.isPresent()) {
             return resolved;
         }
+        // ProjectileData is empty for pearls loaded from chunks and unreliable on
+        // 2b2t. Always fall back to closest-player distance check.
         return resolveOwnerFromClosestPlayer(pearl, entities);
     }
 
@@ -428,7 +467,7 @@ public class AutoDetectModule extends Module {
 
         Optional<UUID> botUuid = determineBotUuid();
         Entity closest = null;
-        double closestDistanceSq = 2.0;
+        double closestDistanceSq = 256.0; // 16 blocks — covers stasis chamber throw distance
         double pearlX = pearl.getX();
         double pearlY = pearl.getY();
         double pearlZ = pearl.getZ();
@@ -459,7 +498,9 @@ public class AutoDetectModule extends Module {
         UUID ownerUuid = closest.getUuid();
         String ownerName = ownerUuid != null ? resolveOwnerName(ownerUuid).orElse(null) : null;
 
-        if (ownerUuid == null && ownerName == null) {
+        // Accept UUID-only if name hasn't resolved yet — the name will be
+        // backfilled on a subsequent tick when the tab list catches up.
+        if (ownerUuid == null) {
             return Optional.empty();
         }
         return Optional.of(new OwnerInfo(ownerUuid, ownerName));
@@ -636,6 +677,7 @@ public class AutoDetectModule extends Module {
         private OwnerInfo owner;
         private String pearlId;
         private boolean waitingForNameLogged;
+        private boolean unauthorizedLogged;
         private long lastMovedAt;
         private boolean conflictNotified;
         private boolean registrationNotified;
@@ -691,6 +733,14 @@ public class AutoDetectModule extends Module {
 
         void clearWaitingForNameLog() {
             this.waitingForNameLogged = false;
+        }
+
+        boolean unauthorizedLogged() {
+            return unauthorizedLogged;
+        }
+
+        void markUnauthorizedLogged() {
+            this.unauthorizedLogged = true;
         }
 
         boolean conflictNotified() {

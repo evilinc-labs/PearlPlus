@@ -10,6 +10,7 @@ import java.util.UUID;
 
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
+import static dev.zenith.pearlplus.PearlPlusPlugin.LEDGER;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class AutoLoadModule extends Module {
@@ -30,13 +31,19 @@ public class AutoLoadModule extends Module {
     private void onWhisper(WhisperChatEvent event) {
         if (!PLUGIN_CONFIG.autoLoad.enabled || event.outgoing()) return;
 
+        var sender = event.sender();
+        String name = sender.getName();
+        UUID uuid = sender.getProfileId();
+
+        // Hydra authorization: completely ignore whispers from non-Hydra users.
+        if (!LEDGER.isAuthorized(uuid)) {
+            return;
+        }
+
         String rawMessage = event.message().trim();
         String msg = rawMessage.toLowerCase();
         String[] lowerParts = msg.split("\\s+");
         String[] parts = rawMessage.trim().split("\\s+");
-        var sender = event.sender();
-        String name = sender.getName();
-        UUID uuid = sender.getProfileId();
 
         // Check whitelist for load commands
         if (msg.startsWith("load")) {
