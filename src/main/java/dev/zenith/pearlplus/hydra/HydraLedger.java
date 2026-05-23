@@ -40,13 +40,17 @@ public class HydraLedger {
     }
 
     /**
-     * Check if a Minecraft UUID is authorized to place pearls at this base.
+     * Check if a Minecraft UUID is authorized at this base.
      *
-     * <p>Currently returns {@code true} for all non-null UUIDs — ledger
-     * enforcement is disabled so all players' pearls are respected.
+     * <p>When Hydra integration is active (ledger has been received), only
+     * UUIDs present in the ledger are authorized. When running standalone
+     * (no C2 / no ledger ever received), returns {@code true} for all
+     * non-null UUIDs to preserve backwards-compatible open-registration.
      */
     public boolean isAuthorized(UUID uuid) {
-        return uuid != null;
+        if (uuid == null) return false;
+        if (!ledgerReceived) return true; // standalone mode — no C2
+        return authorized.containsKey(uuid);
     }
 
     /**

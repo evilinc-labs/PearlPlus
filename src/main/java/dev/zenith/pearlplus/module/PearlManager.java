@@ -31,6 +31,15 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 public class PearlManager {
     private final Module notifier;
 
+    // Tracks pearl columns currently being loaded by the bot.
+    // Checked by AutoDetectModule to distinguish bot loads from external pops.
+    private static final Set<String> loadingColumns = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Returns true if a pearl at (x, z) is currently being loaded by the bot. */
+    public static boolean isLoadInProgress(int x, int z) {
+        return loadingColumns.contains(x + "," + z);
+    }
+
     public PearlManager(Module notifier) {
         this.notifier = notifier;
     }
@@ -157,6 +166,7 @@ public class PearlManager {
         return CACHE.getEntityCache().getEntities().values().stream()
                 .anyMatch(entity -> entity.getEntityType() == org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType.ENDER_PEARL
                         && Math.floor(entity.getX()) == pearl.x
+                        && Math.floor(entity.getY()) == pearl.y
                         && Math.floor(entity.getZ()) == pearl.z);
     }
 
@@ -174,31 +184,45 @@ public class PearlManager {
     }
 
     /**
-     * Scan 1-2 blocks above the pearl entity for a non-iron trapdoor.
-     * Stasis chambers place a trapdoor above the ender pearl — right-clicking
-     * the trapdoor is what triggers the pearl teleport.
+     * Locate the trapdoor that holds the pearl in stasis. AutoDetectModule
+     * stores {@code floor(entity.y)} which is the AIR block the pearl entity
+     * floats in — the actual trapdoor is typically one block BELOW (the pearl
+     * rests on a closed trapdoor at pearl.y - 1) or one block ABOVE (water-
+     * column chambers with the trapdoor on top).
      *
-     * @return the Y coordinate to right-click, or pearl.y if no suitable trapdoor found.
+     * <p>Scan order: -1, 0, +1, -2, +2. The first non-iron trapdoor wins.
+     * Falls back to {@code pearl.y - 1} (the most common case) instead of
+     * {@code pearl.y} which is always the air block.
+     *
+     * @return the Y coordinate to right-click.
      */
     private int findTrapdoorY(PearlPlusConfig.StoredPearl pearl) {
+        int[] order = { -1, 0, 1, -2, 2 };
         try {
-            for (int dy = 1; dy <= 2; dy++) {
+            Chunk chunk = CACHE.getChunkCache().get(pearl.x >> 4, pearl.z >> 4);
+            if (chunk == null) {
+                return pearl.y - 1;
+            }
+            for (int dy : order) {
                 int checkY = pearl.y + dy;
-                Chunk chunk = CACHE.getChunkCache().get(pearl.x >> 4, pearl.z >> 4);
-                if (chunk == null) break;
                 int stateId = chunk.getBlockStateId(pearl.x & 15, checkY, pearl.z & 15);
                 Block block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
                 if (block == null) continue;
                 String name = block.name();
-                if (name != null && name.contains("trapdoor") && !name.contains("iron")) {
-                    info("Found trapdoor at Y=" + checkY + " (" + name + ") above pearl at Y=" + pearl.y);
+                if (name == null) continue;
+                if (name.contains("trapdoor") && !name.contains("iron")) {
+                    info("Found trapdoor at Y=" + checkY + " (" + name + ") for pearl at Y=" + pearl.y);
                     return checkY;
                 }
             }
         } catch (Exception e) {
-            LOG.warn("[PearlPlus] Error scanning for trapdoor above pearl", e);
+            LOG.warn("[PearlPlus] Error scanning for trapdoor near pearl", e);
         }
-        return pearl.y;
+        // No trapdoor in the ±2 window. The pearl rests on SOMETHING — most
+        // commonly a closed trapdoor at Y-1 (default), occasionally a slime
+        // block or honey block. Returning Y-1 gives Baritone a real block to
+        // interact with even when chunk lookup misses.
+        return pearl.y - 1;
     }
 
     public void loadPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
@@ -217,8 +241,11 @@ public class PearlManager {
 
         int targetY = findTrapdoorY(pearl);
         BlockPos current = CACHE.getPlayerCache().getThePlayer().blockPos();
+        String colKey = pearl.x + "," + pearl.z;
+        loadingColumns.add(colKey);
         BARITONE.rightClickBlock(pearl.x, targetY, pearl.z)
                 .addExecutedListener(f -> {
+                    loadingColumns.remove(colKey);
                     var builder = Embed.builder()
                             .title("Pearl Loaded!")
                             .addField("Pearl ID", pearl.pearlId, false)

@@ -24,6 +24,7 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
     public static ComponentLogger LOG;
     public static final HydraLedger LEDGER = new HydraLedger();
     public static AutoDetectModule AUTO_DETECT;
+    public static HydraIntegration HYDRA;
 
     @Override
     public void onLoad(PluginAPI pluginAPI) {
@@ -38,9 +39,9 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
 
         // Optional Hydra C2 integration — activates only when HYDRA_RABBIT_URL and
         // HYDRA_AGENT_ID env vars are present. No-ops silently on standalone deployments.
-        HydraIntegration hydra = new HydraIntegration();
-        API.registerModule(hydra);
-        hydra.tryConnect();
+        HYDRA = new HydraIntegration();
+        API.registerModule(HYDRA);
+        HYDRA.tryConnect();
 
         LOG.info("PearlPlus Plugin loaded!");
     }

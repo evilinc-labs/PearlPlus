@@ -1,6 +1,7 @@
 package dev.zenith.pearlplus.hydra;
 
 import com.github.rfresh2.EventConsumer;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.rabbitmq.client.*;
@@ -108,6 +109,11 @@ public class HydraIntegration extends Module {
     private volatile boolean    hydraActive = false;
     private String agentId;
 
+    // Pearl audit: runs on proxy.online and every 5 minutes (6000 ticks).
+    private static final int AUDIT_INTERVAL_TICKS = 6000; // ~5 minutes at 20 tps
+    private int auditTickCounter = 0;
+    private boolean auditOnNextTick = false; // set by proxy.online event
+
     // ── Module lifecycle ────────────────────────────────────────────────────────
 
     /** Always enabled so ZenithProxy keeps the event subscription alive. */
@@ -118,7 +124,14 @@ public class HydraIntegration extends Module {
 
     @Override
     public List<EventConsumer<?>> registerEvents() {
-        return List.of(of(ClientBotTick.class, this::onGameTick));
+        return List.of(
+            of(ClientBotTick.class, this::onGameTick),
+            of(ClientBotTick.Stopped.class, event -> {
+                // Schedule an audit on next connect so we reconcile pearl state.
+                auditOnNextTick = true;
+                auditTickCounter = 0;
+            })
+        );
     }
 
     /**
@@ -197,6 +210,11 @@ public class HydraIntegration extends Module {
                 return;
             }
 
+            if ("PEARL_PURGE_PLAYERS".equals(type)) {
+                handlePearlPurgePlayers(msg);
+                return;
+            }
+
             if (!"PEARL_LOAD".equals(type)) return; // not our command
 
             String commandId  = msg.has("commandId") ? msg.get("commandId").getAsString() : "";
@@ -240,16 +258,33 @@ public class HydraIntegration extends Module {
         while ((req = pendingLoads.poll()) != null) {
             processPearlLoad(req);
         }
+
+        // Pearl audit: run on first tick after connect, then every 5 minutes.
+        if (auditOnNextTick) {
+            auditOnNextTick = false;
+            auditTickCounter = 0;
+            // Delay audit by a few seconds to let entity cache populate.
+            auditTickCounter = AUDIT_INTERVAL_TICKS - 100; // ~5 seconds from now
+        }
+        auditTickCounter++;
+        if (auditTickCounter >= AUDIT_INTERVAL_TICKS) {
+            auditTickCounter = 0;
+            runPearlAudit();
+        }
     }
 
     /**
-     * Applies a ledger update: replaces the authorized user list.
-     * Purge of unauthorized pearls is currently disabled — all players'
-     * pearls are respected regardless of ledger membership.
+     * Applies a ledger update: replaces the authorized user list, then purges
+     * any stored pearl data for players who are no longer authorized.
      * Runs on the game thread — safe to modify PLUGIN_CONFIG.
      */
     private void processLedgerUpdate(List<HydraLedger.LedgerEntry> entries) {
         PearlPlusPlugin.LEDGER.update(entries);
+        // Purge pearl data for any player not in the new ledger.
+        int purged = pearlManager.purgeUnauthorized(PearlPlusPlugin.LEDGER.authorizedUUIDs());
+        if (purged > 0) {
+            LOG.info("[Hydra] Purged pearl data for {} unauthorized player(s) after ledger update", purged);
+        }
     }
 
     /**
@@ -262,6 +297,14 @@ public class HydraIntegration extends Module {
     }
 
     private void processPearlLoad(PearlLoadRequest req) {
+        // Authorization: reject loads from non-Hydra users.
+        if (!PearlPlusPlugin.LEDGER.isAuthorized(req.playerUUID())) {
+            LOG.info("[Hydra] Rejected PEARL_LOAD for unauthorized player {} ({})",
+                req.playerName(), req.playerUUID());
+            publishResult(req.commandId(), "error", -1, null, req.playerName());
+            return;
+        }
+
         // Don't waste pearls on offline players — check the server tab list first.
         if (!isPlayerOnline(req.playerUUID())) {
             publishResult(req.commandId(), "player_offline", -1, null, req.playerName());
@@ -460,6 +503,131 @@ public class HydraIntegration extends Module {
         pendingLedgerUpdates.add(entries);
     }
 
+    // ── External pearl pop notification ────────────────────────────────────────
+
+    /**
+     * Publishes an {@code agent.pearl.popped} event when a pearl disappears
+     * without the bot loading it. Called by AutoDetectModule.
+     */
+    public void publishExternalPearlPop(String pearlId, String ownerSummary, int x, int y, int z) {
+        if (!hydraActive || publishCh == null) return;
+
+        JsonObject data = new JsonObject();
+        data.addProperty("pearlId", pearlId != null ? pearlId : "unknown");
+        data.addProperty("owner", ownerSummary);
+        data.addProperty("x", x);
+        data.addProperty("y", y);
+        data.addProperty("z", z);
+        data.addProperty("botLoaded", false);
+
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.popped");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", data);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.popped";
+        byte[] body = envelope.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish pearl.popped: {}", e.getMessage());
+        }
+    }
+
+    // ── Pearl audit ──────────────────────────────────────────────────────────────
+
+    /**
+     * Scans all stored pearl records against live entities and publishes an
+     * {@code agent.pearl.audit} event reporting total expected, total found,
+     * and any missing pearl IDs.
+     * Runs on the game thread — safe to read entity cache and PLUGIN_CONFIG.
+     */
+    private void runPearlAudit() {
+        if (PLUGIN_CONFIG.players.isEmpty()) return;
+
+        int totalExpected = 0;
+        int totalPresent = 0;
+        com.google.gson.JsonArray missingArr = new com.google.gson.JsonArray();
+        com.google.gson.JsonArray playersArr = new com.google.gson.JsonArray();
+
+        for (var entry : PLUGIN_CONFIG.players.entrySet()) {
+            UUID uuid = entry.getKey();
+            PearlPlusConfig.PlayerPearls pp = entry.getValue();
+            if (pp == null || pp.pearls == null) continue;
+
+            int playerExpected = pp.pearls.size();
+            int playerPresent = 0;
+
+            for (var pearlEntry : pp.pearls.entrySet()) {
+                PearlPlusConfig.StoredPearl pearl = pearlEntry.getValue();
+                totalExpected++;
+                if (pearlManager.isPearlPresent(pearl)) {
+                    totalPresent++;
+                    playerPresent++;
+                } else {
+                    JsonObject missing = new JsonObject();
+                    missing.addProperty("pearlId", pearl.pearlId);
+                    missing.addProperty("owner", pp.playerName != null ? pp.playerName : uuid.toString());
+                    missing.addProperty("x", pearl.x);
+                    missing.addProperty("y", pearl.y);
+                    missing.addProperty("z", pearl.z);
+                    missingArr.add(missing);
+                }
+            }
+
+            JsonObject playerObj = new JsonObject();
+            playerObj.addProperty("uuid", uuid.toString());
+            playerObj.addProperty("name", pp.playerName != null ? pp.playerName : "");
+            playerObj.addProperty("expected", playerExpected);
+            playerObj.addProperty("present", playerPresent);
+            playersArr.add(playerObj);
+        }
+
+        // Publish audit result.
+        JsonObject data = new JsonObject();
+        data.addProperty("totalExpected", totalExpected);
+        data.addProperty("totalPresent", totalPresent);
+        data.addProperty("totalMissing", totalExpected - totalPresent);
+        data.add("missing", missingArr);
+        data.add("players", playersArr);
+
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.audit");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", data);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.audit";
+        byte[] body = envelope.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+            if (totalExpected > totalPresent) {
+                LOG.info("[Hydra] Pearl audit: {}/{} present, {} missing", totalPresent, totalExpected, totalExpected - totalPresent);
+            }
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish pearl audit: {}", e.getMessage());
+        }
+    }
+
     // ── PEARL_CLEAR handler ──────────────────────────────────────────────────────
 
     /**
@@ -507,6 +675,74 @@ public class HydraIntegration extends Module {
             );
         } catch (IOException e) {
             LOG.warn("[Hydra] Failed to publish agent.pearl.clear: {}", e.getMessage());
+        }
+    }
+
+    // ── PEARL_PURGE_PLAYERS handler ───────────────────────────────────────────
+
+    /**
+     * Handles {@code PEARL_PURGE_PLAYERS} commands by removing pearl data for
+     * specific player UUIDs. Sent by the C2 when users are purged from Hydra
+     * (left the guild, lost all roles, etc.).
+     *
+     * <p>Inbound payload:
+     * <pre>{@code
+     * {
+     *   "type": "PEARL_PURGE_PLAYERS",
+     *   "commandId": "<uuid>",
+     *   "data": {
+     *     "uuids": ["<mc-uuid>", "<mc-uuid>", ...]
+     *   }
+     * }
+     * }</pre>
+     */
+    private void handlePearlPurgePlayers(JsonObject msg) {
+        String commandId = msg.has("commandId") ? msg.get("commandId").getAsString() : "";
+        JsonObject data = msg.has("data") ? msg.getAsJsonObject("data") : new JsonObject();
+        JsonArray uuids = data.has("uuids") ? data.getAsJsonArray("uuids") : new JsonArray();
+
+        int removed = 0;
+        for (var elem : uuids) {
+            try {
+                UUID uuid = UUID.fromString(elem.getAsString());
+                if (PLUGIN_CONFIG.players.remove(uuid) != null) {
+                    removed++;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        if (PearlPlusPlugin.AUTO_DETECT != null && removed > 0) {
+            PearlPlusPlugin.AUTO_DETECT.resetTracking();
+        }
+        LOG.info("[Hydra] PEARL_PURGE_PLAYERS: removed {}/{} player entries", removed, uuids.size());
+
+        // Publish acknowledgement
+        JsonObject ack = new JsonObject();
+        ack.addProperty("commandId", commandId);
+        ack.addProperty("status", "purged");
+        ack.addProperty("playersRemoved", removed);
+
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.purge");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", ack);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.purge";
+        byte[] body = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish agent.pearl.purge: {}", e.getMessage());
         }
     }
 

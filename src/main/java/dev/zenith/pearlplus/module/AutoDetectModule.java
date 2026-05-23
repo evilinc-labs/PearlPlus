@@ -189,13 +189,43 @@ public class AutoDetectModule extends Module {
     }
 
     private void handlePearlRemoval(TrackedPearl trackedPearl) {
-        info(String.format(
-                "Ender pearl at block %d %d %d thrown by %s broke or despawned",
-                trackedPearl.blockX(),
-                trackedPearl.blockY(),
-                trackedPearl.blockZ(),
-                trackedPearl.ownerSummary()
-        ));
+        boolean botLoaded = PearlManager.isLoadInProgress(trackedPearl.blockX(), trackedPearl.blockZ());
+        if (botLoaded) {
+            info(String.format(
+                    "Pearl at block %d %d %d loaded by bot (owner: %s)",
+                    trackedPearl.blockX(),
+                    trackedPearl.blockY(),
+                    trackedPearl.blockZ(),
+                    trackedPearl.ownerSummary()
+            ));
+        } else {
+            info(String.format(
+                    "Pearl at block %d %d %d POPPED EXTERNALLY (owner: %s) — not loaded by bot",
+                    trackedPearl.blockX(),
+                    trackedPearl.blockY(),
+                    trackedPearl.blockZ(),
+                    trackedPearl.ownerSummary()
+            ));
+            // Alert via Discord — pearl disappeared without a bot load in progress.
+            var builder = com.zenith.discord.Embed.builder()
+                    .title("Pearl Popped Externally")
+                    .addField("Owner", trackedPearl.ownerSummary())
+                    .addField("Pearl", trackedPearl.pearlId() != null ? trackedPearl.pearlId() : "unknown")
+                    .addField("Position", String.format("%d %d %d", trackedPearl.blockX(), trackedPearl.blockY(), trackedPearl.blockZ()))
+                    .errorColor();
+            discordAndIngameNotification(builder);
+
+            // Publish to C2 for auto-lockdown evaluation.
+            if (dev.zenith.pearlplus.PearlPlusPlugin.HYDRA != null) {
+                dev.zenith.pearlplus.PearlPlusPlugin.HYDRA.publishExternalPearlPop(
+                        trackedPearl.pearlId(),
+                        trackedPearl.ownerSummary(),
+                        trackedPearl.blockX(),
+                        trackedPearl.blockY(),
+                        trackedPearl.blockZ()
+                );
+            }
+        }
         acknowledgedColumns.remove(columnOf(trackedPearl.registrationPosition()));
         handleTemporaryRemoval(trackedPearl);
     }
@@ -291,6 +321,30 @@ public class AutoDetectModule extends Module {
                 continue;
             }
 
+            // Enforce per-player pearl limit (max 2 per base).
+            UUID ownerUuid = tracked.owner().uuid();
+            String ownerName = tracked.owner() != null ? tracked.owner().name() : null;
+            PearlPlusConfig.PlayerPearls existing = PLUGIN_CONFIG.players.get(ownerUuid);
+            if (existing != null && existing.pearls.size() >= 2) {
+                // Already at limit — if they somehow have 3+, wipe the newest (last) entry.
+                if (existing.pearls.size() > 2) {
+                    String lastKey = null;
+                    for (String k : existing.pearls.keySet()) {
+                        lastKey = k; // LinkedHashMap iteration order = insertion order
+                    }
+                    if (lastKey != null) {
+                        existing.pearls.remove(lastKey);
+                        info(String.format("Removed excess pearl %s for %s (over 2-pearl limit)", lastKey, tracked.ownerSummary()));
+                    }
+                }
+                if (ownerName != null && !ownerName.isBlank() && !tracked.limitNotified()) {
+                    sendClientPacketAsync(ChatUtil.getWhisperChatPacket(ownerName,
+                            "You already have 2 pearls registered at this base. Remove one before adding another."));
+                    tracked.markLimitNotified();
+                }
+                continue;
+            }
+
             String pearlId = tracked.pearlId();
             if (pearlId == null || pearlId.isBlank()) {
                 pearlId = pearlManager.nextAvailablePearlId(tracked.owner().uuid(), tracked.owner().name());
@@ -311,7 +365,6 @@ public class AutoDetectModule extends Module {
 
             pearlManager.recordPearl(tracked.owner().uuid(), tracked.owner().name(), pearlId, target.x(), target.y(), target.z());
 
-            String ownerName = tracked.owner() != null ? tracked.owner().name() : null;
             if (ownerName != null && !ownerName.isBlank() && sendRegistrationWhisper(ownerName, pearlId)) {
                 tracked.markRegistrationNotified();
             }
@@ -430,13 +483,10 @@ public class AutoDetectModule extends Module {
     }
 
     private Optional<OwnerInfo> resolveOwnerInfo(Entity pearl, Map<Integer, Entity> entities) {
-        Optional<OwnerInfo> resolved = resolveOwnerFromProjectileOwner(pearl, entities);
-        if (resolved.isPresent()) {
-            return resolved;
-        }
-        // ProjectileData is empty for pearls loaded from chunks and unreliable on
-        // 2b2t. Always fall back to closest-player distance check.
-        return resolveOwnerFromClosestPlayer(pearl, entities);
+        // Only register pearls with a verified thrower from ProjectileData.
+        // Pearls loaded from chunks (no ProjectileData) are silently ignored —
+        // they will be picked up if re-thrown by a known player.
+        return resolveOwnerFromProjectileOwner(pearl, entities);
     }
 
     private Optional<OwnerInfo> resolveOwnerFromProjectileOwner(Entity pearl, Map<Integer, Entity> entities) {
@@ -681,6 +731,7 @@ public class AutoDetectModule extends Module {
         private long lastMovedAt;
         private boolean conflictNotified;
         private boolean registrationNotified;
+        private boolean limitNotified;
         private boolean moved;
 
         TrackedPearl(BlockPosition position, OwnerInfo owner, long timestamp) {
@@ -757,6 +808,14 @@ public class AutoDetectModule extends Module {
 
         void markRegistrationNotified() {
             this.registrationNotified = true;
+        }
+
+        boolean limitNotified() {
+            return limitNotified;
+        }
+
+        void markLimitNotified() {
+            this.limitNotified = true;
         }
 
         boolean hasMoved() {
