@@ -5,7 +5,9 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.rabbitmq.client.*;
+import com.zenith.cache.data.chunk.Chunk;
 import com.zenith.event.client.ClientBotTick;
+import com.zenith.event.client.ClientOnlineEvent;
 import com.zenith.module.api.Module;
 import dev.zenith.pearlplus.PearlPlusConfig;
 import dev.zenith.pearlplus.PearlPlusPlugin;
@@ -114,6 +116,16 @@ public class HydraIntegration extends Module {
     private int auditTickCounter = 0;
     private boolean auditOnNextTick = false; // set by proxy.online event
 
+    // Readiness gate for PEARL_LOAD after a fresh login. proxy.online fires the
+    // instant JoinGame is processed, but chunks + entity cache populate over
+    // the next 1-2 seconds. Defer PEARL_LOAD until either the target pearl's
+    // chunk is in cache OR the bot has been online long enough. After
+    // PEARL_LOAD_MAX_DEFER_TICKS, give up and process anyway (better to fail
+    // loudly than hang forever).
+    private static final int PEARL_LOAD_MIN_UPTIME_TICKS = 20;  // ~1s at 20 tps
+    private static final int PEARL_LOAD_MAX_DEFER_TICKS  = 60;  // ~3s at 20 tps
+    private long onlineSinceMillis = -1L;
+
     // ── Module lifecycle ────────────────────────────────────────────────────────
 
     /** Always enabled so ZenithProxy keeps the event subscription alive. */
@@ -126,10 +138,17 @@ public class HydraIntegration extends Module {
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
             of(ClientBotTick.class, this::onGameTick),
+            of(ClientOnlineEvent.class, event -> {
+                // Stamp the moment we entered the game world. PEARL_LOADs that
+                // arrive within PEARL_LOAD_MIN_UPTIME_TICKS get deferred until
+                // chunks settle.
+                onlineSinceMillis = System.currentTimeMillis();
+            }),
             of(ClientBotTick.Stopped.class, event -> {
                 // Schedule an audit on next connect so we reconcile pearl state.
                 auditOnNextTick = true;
                 auditTickCounter = 0;
+                onlineSinceMillis = -1L;
             })
         );
     }
@@ -296,6 +315,24 @@ public class HydraIntegration extends Module {
         return CACHE.getTabListCache().get(playerUUID).isPresent();
     }
 
+    /**
+     * Returns true if it's safe to process a PEARL_LOAD now. False = caller
+     * should re-queue and wait another tick. Gated on:
+     *   1. Bot has been online at least PEARL_LOAD_MIN_UPTIME_TICKS — covers
+     *      the post-JoinGame settle window
+     *   2. The chunk containing the target pearl is loaded — covers the case
+     *      where the bot logged in far from the pearl base and chunks are
+     *      still streaming in
+     */
+    private boolean readyForLoad(PearlPlusConfig.StoredPearl pearl) {
+        if (onlineSinceMillis < 0) return false;
+        long elapsedMs = System.currentTimeMillis() - onlineSinceMillis;
+        if (elapsedMs < (PEARL_LOAD_MIN_UPTIME_TICKS * 50L)) return false;
+        if (pearl == null || CACHE == null || CACHE.getChunkCache() == null) return false;
+        Chunk chunk = CACHE.getChunkCache().get(pearl.x >> 4, pearl.z >> 4);
+        return chunk != null;
+    }
+
     private void processPearlLoad(PearlLoadRequest req) {
         // Authorization: reject loads from non-Hydra users.
         if (!PearlPlusPlugin.LEDGER.isAuthorized(req.playerUUID())) {
@@ -328,6 +365,16 @@ public class HydraIntegration extends Module {
         PearlPlusConfig.StoredPearl pearl = playerEntry.pearls.get(pearlId);
         if (pearl == null) {
             publishResult(req.commandId(), "not_found", 0, pearlId, req.playerName());
+            return;
+        }
+
+        // Readiness gate: defer if we just entered the game and the pearl's
+        // chunk isn't loaded yet. Up to PEARL_LOAD_MAX_DEFER_TICKS retries
+        // (~3s), then we proceed anyway and let the downstream code fail
+        // loudly. See c2 LazyPearlManager.lazyOnlineSettle for the matching
+        // server-side settle window.
+        if (req.deferredTicks() < PEARL_LOAD_MAX_DEFER_TICKS && !readyForLoad(pearl)) {
+            pendingLoads.add(req.defer());
             return;
         }
 
@@ -748,5 +795,12 @@ public class HydraIntegration extends Module {
 
     // ── Internal types ──────────────────────────────────────────────────────────
 
-    private record PearlLoadRequest(String commandId, UUID playerUUID, String playerName) {}
+    private record PearlLoadRequest(String commandId, UUID playerUUID, String playerName, int deferredTicks) {
+        PearlLoadRequest(String commandId, UUID playerUUID, String playerName) {
+            this(commandId, playerUUID, playerName, 0);
+        }
+        PearlLoadRequest defer() {
+            return new PearlLoadRequest(commandId, playerUUID, playerName, deferredTicks + 1);
+        }
+    }
 }
