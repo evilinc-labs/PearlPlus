@@ -1,5 +1,7 @@
 package dev.zenith.pearlplus.command;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandCategory;
@@ -13,8 +15,17 @@ import dev.zenith.pearlplus.module.AutoLoadModule;
 import dev.zenith.pearlplus.module.AutoDetectModule;
 import dev.zenith.pearlplus.module.PearlManager;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.getInteger;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
@@ -27,6 +38,108 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
 
 public class PearlPlusCommand extends Command {
+
+    // Minetools (api.minetools.eu) has been intermittently dead — 503s,
+    // timeouts. Fall back to Mojang's official lookup when it fails so
+    // `pp add <user>` etc. don't bail with "Invalid username" for real names.
+    //
+    // Mojang's limit is ~60 req/min/IP with a sliding window. We cap ourselves
+    // well under that and cache aggressively so we never hammer them:
+    //   - min interval between Mojang calls: 1500ms (~40 req/min)
+    //   - positive cache: 1 hour (usernames are stable; new owners get the
+    //     name only after 37-day reservation, so 1h staleness is fine)
+    //   - negative cache: 5 minutes (so a transient outage doesn't cause us
+    //     to retry-spam, but real fixes propagate within 5 min)
+
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(4))
+            .build();
+
+    private static final long MOJANG_MIN_INTERVAL_MS = 1500L;
+    private static final long POSITIVE_TTL_MS = 60L * 60L * 1000L;
+    private static final long NEGATIVE_TTL_MS = 5L * 60L * 1000L;
+    private static final long MAX_BACKOFF_WAIT_MS = 5000L;
+
+    private record CacheEntry(Optional<UUID> uuid, long expiresAt) {}
+    private static final Map<String, CacheEntry> UUID_CACHE = new ConcurrentHashMap<>();
+    private static final AtomicLong lastMojangCallMillis = new AtomicLong(0L);
+
+    private static Optional<UUID> resolveUuid(String name) {
+        if (name == null || name.isBlank()) return Optional.empty();
+        String key = name.toLowerCase(Locale.ROOT);
+
+        CacheEntry cached = UUID_CACHE.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && cached.expiresAt > now) return cached.uuid;
+
+        // Try Minetools first — separate service, its own limits.
+        try {
+            Optional<MinetoolsUuidResponse> mt = MinetoolsApi.INSTANCE.getProfileFromUsername(name);
+            if (mt.isPresent() && mt.get().uuid() != null) {
+                Optional<UUID> r = Optional.of(mt.get().uuid());
+                UUID_CACHE.put(key, new CacheEntry(r, now + POSITIVE_TTL_MS));
+                return r;
+            }
+        } catch (Throwable ignored) {}
+
+        // Fall back to Mojang with self-imposed rate limit.
+        Optional<UUID> mojang = mojangLookup(name);
+        long ttl = mojang.isPresent() ? POSITIVE_TTL_MS : NEGATIVE_TTL_MS;
+        UUID_CACHE.put(key, new CacheEntry(mojang, now + ttl));
+        return mojang;
+    }
+
+    private static Optional<UUID> mojangLookup(String name) {
+        // Token-bucket-of-one: each call must be ≥ MOJANG_MIN_INTERVAL_MS
+        // after the previous one. If we'd be too soon, sleep up to
+        // MAX_BACKOFF_WAIT_MS; if even that wouldn't be enough, bail.
+        while (true) {
+            long now = System.currentTimeMillis();
+            long last = lastMojangCallMillis.get();
+            long earliest = last + MOJANG_MIN_INTERVAL_MS;
+            if (now >= earliest) {
+                if (lastMojangCallMillis.compareAndSet(last, now)) break;
+                continue; // lost race, re-read
+            }
+            long wait = earliest - now;
+            if (wait > MAX_BACKOFF_WAIT_MS) {
+                LOG.warn("Mojang lookup for {} skipped — rate limit window {}ms exceeds max backoff", name, wait);
+                return Optional.empty();
+            }
+            try { Thread.sleep(wait); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Optional.empty();
+            }
+        }
+
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.mojang.com/users/profiles/minecraft/" + name))
+                    .timeout(Duration.ofSeconds(5))
+                    .header("User-Agent", "PearlPlus")
+                    .GET()
+                    .build();
+            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 429) {
+                LOG.warn("Mojang rate-limited us on {} — cooling off", name);
+                return Optional.empty();
+            }
+            if (resp.statusCode() != 200 || resp.body() == null || resp.body().isBlank()) {
+                return Optional.empty();
+            }
+            JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
+            if (!obj.has("id")) return Optional.empty();
+            String hex = obj.get("id").getAsString();
+            if (hex.length() != 32) return Optional.empty();
+            String dashed = hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-"
+                    + hex.substring(12, 16) + "-" + hex.substring(16, 20) + "-" + hex.substring(20);
+            return Optional.of(UUID.fromString(dashed));
+        } catch (Throwable t) {
+            LOG.warn("Mojang lookup failed for {}: {}", name, t.getMessage());
+            return Optional.empty();
+        }
+    }
+
     @Override
     public CommandUsage commandUsage() {
         return CommandUsage.builder()
@@ -91,13 +204,12 @@ public class PearlPlusCommand extends Command {
                 }))
                 .then(argument("playerName", wordWithChars()).executes(c -> {
                     String name = getString(c, "playerName");
-                    Optional<MinetoolsUuidResponse> result =
-                            MinetoolsApi.INSTANCE.getProfileFromUsername(name);
+                    Optional<UUID> result = resolveUuid(name);
                     if (result.isEmpty()) {
                         c.getSource().getEmbed().title("Invalid username: " + name);
                         return 0;
                     }
-                    UUID uuid = result.get().uuid();
+                    UUID uuid = result.get();
                     PearlManager manager = new PearlManager(MODULE.get(AutoDetectModule.class));
                     String pearls = manager.pearlsListWithCoords(uuid);
                     c.getSource().getEmbed().title("Pearls for " + name).description(pearls);
