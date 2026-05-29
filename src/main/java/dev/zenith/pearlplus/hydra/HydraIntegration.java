@@ -469,11 +469,26 @@ public class HydraIntegration extends Module {
             return;
         }
 
-        // Resolve which pearl to load — honours default and autoDefaultToPresent setting.
+        // Resolve which pearl to load — honours default and autoDefaultToPresent setting,
+        // then skip any slot whose committed sidecar state is POPPED so the bot never
+        // attempts an empty stasis chamber. UNKNOWN slots are allowed through (state not
+        // yet observed — could be PRESENT; let the load attempt and fail naturally if not).
         String pearlId = pearlManager.defaultPearlId(req.playerUUID());
         if (pearlId == null) {
             publishResult(req.commandId(), "not_found", 0, null, req.playerName());
             return;
+        }
+
+        if (stateStore != null && stateStore.stateOf(req.playerUUID(), pearlId) == PearlPresence.POPPED) {
+            // Default slot is confirmed popped — try the other registered slots.
+            pearlId = playerEntry.pearls.keySet().stream()
+                    .filter(id -> stateStore.stateOf(req.playerUUID(), id) != PearlPresence.POPPED)
+                    .findFirst()
+                    .orElse(null);
+            if (pearlId == null) {
+                publishResult(req.commandId(), "no_pearls", 0, null, req.playerName());
+                return;
+            }
         }
 
         PearlPlusConfig.StoredPearl pearl = playerEntry.pearls.get(pearlId);

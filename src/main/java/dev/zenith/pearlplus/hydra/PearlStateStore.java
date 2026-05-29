@@ -7,6 +7,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import static com.zenith.Globals.saveConfig;
+
 // Owns the sidecar presence config. Reads PLUGIN_CONFIG.players read-only and
 // only ever writes its own file — registration is never touched here. All
 // access is synchronized: observe() runs on the game thread, count reads can
@@ -40,6 +42,9 @@ public final class PearlStateStore {
             byPearl.computeIfAbsent(pearlId, k -> new PearlStateConfig.Observation());
         obs.state = state.name();
         obs.lastObservedMillis = nowMillis;
+        // Flush to disk immediately so state survives a kill/restart.
+        // Runs on the game tick thread — same thread ZenithProxy uses for its own saves.
+        saveConfig();
         return prior;
     }
 
