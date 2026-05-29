@@ -111,10 +111,28 @@ public class HydraIntegration extends Module {
     private volatile boolean    hydraActive = false;
     private String agentId;
 
+    // Sidecar presence state. Registered only when Hydra is active so standalone
+    // deployments stay byte-identical. Tracks observed PRESENT/POPPED/UNKNOWN
+    // per pearl without ever mutating the registration ledger.
+    private PearlStateStore stateStore;
+
     // Pearl audit: runs on proxy.online and every 5 minutes (6000 ticks).
     private static final int AUDIT_INTERVAL_TICKS = 6000; // ~5 minutes at 20 tps
     private int auditTickCounter = 0;
     private boolean auditOnNextTick = false; // set by proxy.online event
+
+    // Sidecar presence sweep: re-evaluates each registered pearl into the
+    // PearlStateStore. Reads-only against the ledger; emits nothing yet.
+    private static final int STATE_SWEEP_INTERVAL_TICKS = 20; // ~1s at 20 tps
+    private int stateSweepTickCounter = 0;
+
+    // Detection debounce: require N consecutive consistent reads before
+    // committing a transition, so transient entity-cache flicker or sub-block
+    // jitter near a block boundary cannot flap the state.
+    private static final int STATE_CONFIRM_READS = 3;
+    private static final double PEARL_Y_TOLERANCE = 1.0; // absorbs floor-vs-round Y + jitter
+    private final java.util.Map<String, PearlPresence> pendingState = new java.util.HashMap<>();
+    private final java.util.Map<String, Integer> pendingCount = new java.util.HashMap<>();
 
     // Readiness gate for PEARL_LOAD after a fresh login. proxy.online fires the
     // instant JoinGame is processed, but chunks + entity cache populate over
@@ -165,6 +183,10 @@ public class HydraIntegration extends Module {
             LOG.info("[Hydra] HYDRA_RABBIT_URL / HYDRA_AGENT_ID not set — Hydra integration disabled");
             return;
         }
+
+        // Hydra-configured bot — bring up the sidecar presence store. Separate
+        // config file from the pearl ledger; does not touch registration.
+        stateStore = new PearlStateStore();
 
         try {
             ConnectionFactory factory = new ConnectionFactory();
@@ -290,6 +312,11 @@ public class HydraIntegration extends Module {
             auditTickCounter = 0;
             runPearlAudit();
         }
+
+        if (stateStore != null && ++stateSweepTickCounter >= STATE_SWEEP_INTERVAL_TICKS) {
+            stateSweepTickCounter = 0;
+            sweepPearlStates();
+        }
     }
 
     /**
@@ -331,6 +358,93 @@ public class HydraIntegration extends Module {
         if (pearl == null || CACHE == null || CACHE.getChunkCache() == null) return false;
         Chunk chunk = CACHE.getChunkCache().get(pearl.x >> 4, pearl.z >> 4);
         return chunk != null;
+    }
+
+    // True if the bot is close enough to positively observe this pearl's spot.
+    // Mirrors PearlManager.isWithinPresenceRange (which is private) so the sweep
+    // shares the same range semantics as the load path.
+    private boolean inRange(PearlPlusConfig.StoredPearl pearl) {
+        if (pearl == null || CACHE == null || CACHE.getPlayerCache() == null
+                || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+        var player = CACHE.getPlayerCache().getThePlayer();
+        double dx = player.getX() - pearl.x;
+        double dy = player.getY() - pearl.y;
+        double dz = player.getZ() - pearl.z;
+        double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        return distance <= PLUGIN_CONFIG.autoDetect.temporaryRemovalRange;
+    }
+
+    // True if an ender-pearl entity sits at this pearl's spot. X/Z matched
+    // exactly (both stored and compared with floor — no mismatch there); Y is
+    // matched with tolerance because registration stores round(Y) while entity
+    // Y jitters sub-block, so an exact floor compare flaps near a boundary.
+    private boolean pearlEntityPresent(PearlPlusConfig.StoredPearl pearl) {
+        if (CACHE == null || CACHE.getEntityCache() == null) return false;
+        return CACHE.getEntityCache().getEntities().values().stream()
+                .anyMatch(e -> e.getEntityType()
+                            == org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType.ENDER_PEARL
+                        && (int) Math.floor(e.getX()) == pearl.x
+                        && (int) Math.floor(e.getZ()) == pearl.z
+                        && Math.abs(e.getY() - pearl.y) <= PEARL_Y_TOLERANCE);
+    }
+
+    // Re-evaluate every registered pearl into the sidecar. A pearl is only
+    // PRESENT/POPPED when we can actually see its spot (ready + chunk loaded +
+    // in range), otherwise UNKNOWN. A change from the committed state must hold
+    // for STATE_CONFIRM_READS consecutive sweeps before it commits, so flicker
+    // cannot flap the ledger. Reads the ledger read-only; logs transitions for
+    // now and emits nothing downstream yet.
+    private void sweepPearlStates() {
+        if (stateStore == null) return;
+        stateStore.pruneToLedger();
+        long now = System.currentTimeMillis();
+        for (var entry : PLUGIN_CONFIG.players.entrySet()) {
+            UUID owner = entry.getKey();
+            PearlPlusConfig.PlayerPearls pp = entry.getValue();
+            if (pp == null || pp.pearls == null) continue;
+            for (var pearlEntry : pp.pearls.entrySet()) {
+                String pearlId = pearlEntry.getKey();
+                PearlPlusConfig.StoredPearl stored = pearlEntry.getValue();
+                if (stored == null) continue;
+
+                PearlPresence eval;
+                if (readyForLoad(stored) && inRange(stored)) {
+                    eval = pearlEntityPresent(stored) ? PearlPresence.PRESENT : PearlPresence.POPPED;
+                } else {
+                    eval = PearlPresence.UNKNOWN;
+                }
+
+                String key = owner + "|" + pearlId;
+                PearlPresence committed = stateStore.stateOf(owner, pearlId);
+
+                // No new info, or already matches committed — clear any pending candidate.
+                if (eval == PearlPresence.UNKNOWN || eval == committed) {
+                    pendingState.remove(key);
+                    pendingCount.remove(key);
+                    continue;
+                }
+
+                // Candidate differs from committed — needs to hold N reads to commit.
+                if (pendingState.get(key) == eval) {
+                    int count = pendingCount.merge(key, 1, Integer::sum);
+                    if (count >= STATE_CONFIRM_READS) {
+                        PearlPresence prior = stateStore.observe(owner, pearlId, eval, now);
+                        pendingState.remove(key);
+                        pendingCount.remove(key);
+                        LOG.info("[Hydra] Pearl state {} -> {} for {} (pearl {} at {} {} {})",
+                                prior, eval,
+                                pp.playerName != null ? pp.playerName : owner.toString(),
+                                pearlId, stored.x, stored.y, stored.z);
+                        publishPearlState(owner, pp.playerName, pearlId, eval, stored);
+                    }
+                } else {
+                    pendingState.put(key, eval);
+                    pendingCount.put(key, 1);
+                }
+            }
+        }
     }
 
     private void processPearlLoad(PearlLoadRequest req) {
@@ -470,10 +584,16 @@ public class HydraIntegration extends Module {
             playerObj.addProperty("pearlCount", pp.pearls.size());
 
             com.google.gson.JsonArray pearlIds = new com.google.gson.JsonArray();
+            com.google.gson.JsonObject pearlStates = new com.google.gson.JsonObject();
             for (String id : pp.pearls.keySet()) {
                 pearlIds.add(id);
+                // Observed presence per pearl. Additive — legacy consumers read
+                // pearlCount/pearlIds and ignore this. UNKNOWN when unobserved.
+                PearlPresence state = stateStore != null ? stateStore.stateOf(uuid, id) : PearlPresence.UNKNOWN;
+                pearlStates.addProperty(id, state.name());
             }
             playerObj.add("pearlIds", pearlIds);
+            playerObj.add("pearlStates", pearlStates);
 
             playersArr.add(playerObj);
         }
@@ -588,6 +708,48 @@ public class HydraIntegration extends Module {
             );
         } catch (IOException e) {
             LOG.warn("[Hydra] Failed to publish pearl.popped: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Publishes an {@code agent.pearl.state} event when a pearl's observed
+     * presence changes (committed transition from the sweep). Additive — the C2
+     * cache applies it in real time; consumers that don't know it ignore it.
+     */
+    private void publishPearlState(UUID owner, String playerName, String pearlId,
+                                   PearlPresence state, PearlPlusConfig.StoredPearl pearl) {
+        if (!hydraActive || publishCh == null) return;
+
+        JsonObject data = new JsonObject();
+        data.addProperty("uuid", owner.toString());
+        data.addProperty("name", playerName != null ? playerName : "");
+        data.addProperty("pearlId", pearlId);
+        data.addProperty("state", state.name());
+        data.addProperty("x", pearl.x);
+        data.addProperty("y", pearl.y);
+        data.addProperty("z", pearl.z);
+
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("agentId", agentId);
+        envelope.addProperty("eventType", "agent.pearl.state");
+        envelope.addProperty("ts", System.currentTimeMillis());
+        envelope.add("data", data);
+
+        String routingKey = "agent." + agentId + ".agent.pearl.state";
+        byte[] body = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+        try {
+            publishCh.basicPublish(
+                EXCHANGE_EVENTS, routingKey,
+                false, false,
+                new AMQP.BasicProperties.Builder()
+                    .contentType("application/json")
+                    .deliveryMode(1)
+                    .build(),
+                body
+            );
+        } catch (IOException e) {
+            LOG.warn("[Hydra] Failed to publish agent.pearl.state: {}", e.getMessage());
         }
     }
 

@@ -37,6 +37,9 @@ dataGenerator/run
 # Ignore Gradle build output directory
 build
 
+# IDE-generated class output
+/bin/
+
 .env
 .env.deploy-c2
 
