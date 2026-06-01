@@ -48,6 +48,33 @@ public final class PearlStateStore {
         return prior;
     }
 
+    // Seed PRESENT for every registered pearl that has no observation yet, so a
+    // fresh/empty sidecar reflects the ledger (the source of truth) instead of
+    // leaving registered-but-unobserved pearls UNKNOWN — which hid them from the
+    // hydra count and the GUI. Existing observations (PRESENT/POPPED) are kept:
+    // a real in-range look still owns the truth and can flip a seeded slot to
+    // POPPED later. lastObservedMillis stays 0 so we never claim a look we didn't
+    // take. Returns how many slots were seeded.
+    public synchronized int seedFromLedger() {
+        Map<UUID, PearlPlusConfig.PlayerPearls> players = PearlPlusPlugin.PLUGIN_CONFIG.players;
+        int seeded = 0;
+        for (Map.Entry<UUID, PearlPlusConfig.PlayerPearls> e : players.entrySet()) {
+            PearlPlusConfig.PlayerPearls pp = e.getValue();
+            if (pp == null || pp.pearls == null || pp.pearls.isEmpty()) continue;
+            for (String pearlId : pp.pearls.keySet()) {
+                Map<String, PearlStateConfig.Observation> byPearl = config.observations.get(e.getKey());
+                if (byPearl != null && byPearl.containsKey(pearlId)) continue;
+                byPearl = config.observations.computeIfAbsent(e.getKey(), k -> new LinkedHashMap<>());
+                PearlStateConfig.Observation obs = new PearlStateConfig.Observation();
+                obs.state = PearlPresence.PRESENT.name();
+                byPearl.put(pearlId, obs);
+                seeded++;
+            }
+        }
+        if (seeded > 0) saveConfig();
+        return seeded;
+    }
+
     public synchronized PearlPresence stateOf(UUID owner, String pearlId) {
         Map<String, PearlStateConfig.Observation> byPearl = config.observations.get(owner);
         if (byPearl == null) return PearlPresence.UNKNOWN;

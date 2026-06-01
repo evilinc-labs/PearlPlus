@@ -188,6 +188,12 @@ public class HydraIntegration extends Module {
         // config file from the pearl ledger; does not touch registration.
         stateStore = new PearlStateStore();
 
+        // Trust the ledger on startup: any registered pearl we have no observation
+        // for is seeded PRESENT so hydra/GUI show the accurate registered list
+        // without anyone having to rethrow. Real in-range sweeps still flip these.
+        int seeded = stateStore.seedFromLedger();
+        if (seeded > 0) LOG.info("[Hydra] Seeded {} registered pearl(s) PRESENT from ledger", seeded);
+
         try {
             ConnectionFactory factory = new ConnectionFactory();
             factory.setUri(rabbitUrl);
@@ -331,6 +337,14 @@ public class HydraIntegration extends Module {
         if (purged > 0) {
             LOG.info("[Hydra] Purged pearl data for {} unauthorized player(s) after ledger update", purged);
         }
+        // Seed on sync: reconcile the sidecar to the freshly-synced ledger — drop
+        // rows for purged users, then seed PRESENT for any still-registered pearl
+        // with no observation yet. Keeps hydra/GUI accurate without a restart.
+        if (stateStore != null) {
+            stateStore.pruneToLedger();
+            int seeded = stateStore.seedFromLedger();
+            if (seeded > 0) LOG.info("[Hydra] Seeded {} pearl(s) PRESENT after ledger sync", seeded);
+        }
     }
 
     /**
@@ -399,6 +413,11 @@ public class HydraIntegration extends Module {
     private void sweepPearlStates() {
         if (stateStore == null) return;
         stateStore.pruneToLedger();
+        // Continuously keep the sidecar covering the whole ledger: any registered
+        // pearl we still have no observation for (new AutoDetect registration, far
+        // chamber, post-sync addition) gets a PRESENT floor so hydra/GUI never drop
+        // it. Idempotent — only writes when there's a genuinely new gap.
+        stateStore.seedFromLedger();
         long now = System.currentTimeMillis();
         for (var entry : PLUGIN_CONFIG.players.entrySet()) {
             UUID owner = entry.getKey();

@@ -89,6 +89,21 @@ public class PearlPlusCommand extends Command {
         return mojang;
     }
 
+    // Resolve the player a management command targets. Existing registrations are
+    // matched against the local ledger by stored name FIRST — that works even when
+    // minetools/mojang are down or the player has since renamed. Names we don't
+    // already know fall through to the external lookup (minetools -> mojang).
+    private static Optional<UUID> resolveOwner(String name) {
+        if (name == null || name.isBlank()) return Optional.empty();
+        for (var e : PLUGIN_CONFIG.players.entrySet()) {
+            var pp = e.getValue();
+            if (pp != null && pp.playerName != null && pp.playerName.equalsIgnoreCase(name)) {
+                return Optional.of(e.getKey());
+            }
+        }
+        return resolveUuid(name);
+    }
+
     private static Optional<UUID> mojangLookup(String name) {
         // Token-bucket-of-one: each call must be ≥ MOJANG_MIN_INTERVAL_MS
         // after the previous one. If we'd be too soon, sleep up to
@@ -204,7 +219,7 @@ public class PearlPlusCommand extends Command {
                 }))
                 .then(argument("playerName", wordWithChars()).executes(c -> {
                     String name = getString(c, "playerName");
-                    Optional<UUID> result = resolveUuid(name);
+                    Optional<UUID> result = resolveOwner(name);
                     if (result.isEmpty()) {
                         c.getSource().getEmbed().title("Invalid username: " + name);
                         return 0;
@@ -224,8 +239,7 @@ public class PearlPlusCommand extends Command {
                                                 .then(argument("z", integer()).executes(c -> {
                                                     String name = getString(c, "playerName");
                                                     String pearlId = getString(c, "pearlId");
-                                                    Optional<MinetoolsUuidResponse> result =
-                                                            MinetoolsApi.INSTANCE.getProfileFromUsername(name);
+                                                    Optional<UUID> result = resolveOwner(name);
                                                     if (result.isEmpty()) {
                                                         c.getSource().getEmbed().title("Invalid username: " + name);
                                                         return 0;
@@ -235,7 +249,7 @@ public class PearlPlusCommand extends Command {
                                                     int y = getInteger(c, "y");
                                                     int z = getInteger(c, "z");
 
-                                                    UUID uuid = result.get().uuid();
+                                                    UUID uuid = result.get();
                                                     PearlManager manager = new PearlManager(MODULE.get(AutoDetectModule.class));
                                                     manager.recordPearl(uuid, name, pearlId, x, y, z);
                                                     c.getSource().getEmbed()
@@ -249,14 +263,13 @@ public class PearlPlusCommand extends Command {
                         .then(argument("pearlId", wordWithChars()).executes(c -> {
                             String name = getString(c, "playerName");
                             String pearlId = getString(c, "pearlId");
-                            Optional<MinetoolsUuidResponse> result =
-                                    MinetoolsApi.INSTANCE.getProfileFromUsername(name);
+                            Optional<UUID> result = resolveOwner(name);
                             if (result.isEmpty()) {
                                 c.getSource().getEmbed().title("Invalid username: " + name);
                                 return 0;
                             }
 
-                            UUID uuid = result.get().uuid();
+                            UUID uuid = result.get();
                             PearlManager manager = new PearlManager(MODULE.get(AutoDetectModule.class));
                             String resolvedPearlId = manager.resolvePearlId(uuid, pearlId);
                             if (resolvedPearlId == null) {
@@ -274,14 +287,13 @@ public class PearlPlusCommand extends Command {
                         .then(argument("pearlId", wordWithChars()).executes(c -> {
                             String name = getString(c, "playerName");
                             String pearlId = getString(c, "pearlId");
-                            Optional<MinetoolsUuidResponse> result =
-                                    MinetoolsApi.INSTANCE.getProfileFromUsername(name);
+                            Optional<UUID> result = resolveOwner(name);
                             if (result.isEmpty()) {
                                 c.getSource().getEmbed().title("Invalid username: " + name);
                                 return 0;
                             }
 
-                            UUID uuid = result.get().uuid();
+                            UUID uuid = result.get();
                             PearlManager manager = new PearlManager(MODULE.get(AutoDetectModule.class));
                             String resolvedPearlId = manager.resolvePearlId(uuid, pearlId);
                             if (resolvedPearlId == null) {
