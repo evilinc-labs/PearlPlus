@@ -67,7 +67,10 @@ public class PearlManager {
 
     public PearlPlusConfig.StoredPearl recordPearl(UUID ownerUuid, String ownerName, String pearlId, int x, int y, int z) {
         PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.computeIfAbsent(ownerUuid, uuid -> new PearlPlusConfig.PlayerPearls());
-        entry.playerName = ownerName;
+        // For secret accounts, store the codename — never the observed real username.
+        // This makes the bot "accept a pearl thrown by codename" and keeps the real
+        // name out of the persisted pearl config and every downstream read.
+        entry.playerName = dev.zenith.pearlplus.PearlPlusPlugin.LEDGER.storedName(ownerUuid, ownerName);
         if (entry.defaultPearlId == null || entry.defaultPearlId.isBlank()) {
             entry.defaultPearlId = pearlId;
         }

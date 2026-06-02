@@ -19,7 +19,11 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
  */
 public class HydraLedger {
 
-    public record LedgerEntry(UUID uuid, String name, String rank) {}
+    // secret/hydraUser are optional: secret accounts carry a codename as `name`
+    // (never the real username) and the owning Hydra user's alias as `hydraUser`,
+    // so the bot can render "*codename* [hydraUser]" and treat the codename as
+    // authoritative everywhere it would otherwise surface the real name.
+    public record LedgerEntry(UUID uuid, String name, String rank, boolean secret, String hydraUser) {}
 
     private volatile Map<UUID, LedgerEntry> authorized = new ConcurrentHashMap<>();
     private volatile boolean ledgerReceived = false;
@@ -66,5 +70,48 @@ public class HydraLedger {
      */
     public Set<UUID> authorizedUUIDs() {
         return new HashSet<>(authorized.keySet());
+    }
+
+    /** Ledger entry for a UUID, or null. */
+    public LedgerEntry get(UUID uuid) {
+        return uuid == null ? null : authorized.get(uuid);
+    }
+
+    /** True if the UUID belongs to a secret (codename-only) account. */
+    public boolean isSecret(UUID uuid) {
+        LedgerEntry e = get(uuid);
+        return e != null && e.secret();
+    }
+
+    /**
+     * Safe display label for a player. For a secret account this is the italic
+     * codename followed by [hydraUser] — never the real username; for everyone
+     * else it is the provided observed name unchanged. mcFormat=true uses
+     * Minecraft format codes (§o italic / §r reset) for in-game chat; false uses
+     * markdown-style asterisks for logs and Discord.
+     */
+    public String displayLabel(UUID uuid, String observedName, boolean mcFormat) {
+        LedgerEntry e = get(uuid);
+        if (e == null || !e.secret()) {
+            return observedName;
+        }
+        String hu = (e.hydraUser() != null && !e.hydraUser().isBlank()) ? e.hydraUser() : "?";
+        if (mcFormat) {
+            return "§o" + e.name() + "§r [" + hu + "]";
+        }
+        return "*" + e.name() + "* [" + hu + "]";
+    }
+
+    /**
+     * The name to STORE for a player's pearls. For secret accounts this is the
+     * codename (so the real username never persists to the bot's pearl config or
+     * downstream reads); for everyone else it is the observed name unchanged.
+     */
+    public String storedName(UUID uuid, String observedName) {
+        LedgerEntry e = get(uuid);
+        if (e != null && e.secret()) {
+            return e.name(); // codename
+        }
+        return observedName;
     }
 }

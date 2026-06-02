@@ -410,7 +410,11 @@ public class AutoDetectModule extends Module {
             return;
         }
 
-        String message = String.format("Pearl spot already belongs to %s.", storedOwner.name());
+        // In-game message body: for a secret owner, show "§ocodename§r [hydraUser]"
+        // (Minecraft italics), never the real username.
+        String ownerLabel = dev.zenith.pearlplus.PearlPlusPlugin.LEDGER.displayLabel(
+                storedOwner.uuid(), storedOwner.name(), true);
+        String message = String.format("Pearl spot already belongs to %s.", ownerLabel);
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(throwerName, message));
         info(String.format("Notified %s that loader column is owned by %s", throwerName, storedOwner.describe()));
     }
@@ -708,6 +712,12 @@ public class AutoDetectModule extends Module {
         }
 
         String describe() {
+            // Secret account: codename + [hydraUser] only — never the real name or
+            // the raw (Mojang-reversible) UUID. Covers every ownerSummary() caller
+            // (logs, Discord embeds, the external-pop publish to the C2).
+            if (uuid != null && dev.zenith.pearlplus.PearlPlusPlugin.LEDGER.isSecret(uuid)) {
+                return dev.zenith.pearlplus.PearlPlusPlugin.LEDGER.displayLabel(uuid, name, false);
+            }
             if (hasName()) {
                 return uuid != null ? name + " (" + uuid + ")" : name;
             }

@@ -454,7 +454,8 @@ public class HydraIntegration extends Module {
                         pendingCount.remove(key);
                         LOG.info("[Hydra] Pearl state {} -> {} for {} (pearl {} at {} {} {})",
                                 prior, eval,
-                                pp.playerName != null ? pp.playerName : owner.toString(),
+                                PearlPlusPlugin.LEDGER.displayLabel(owner,
+                                        pp.playerName != null ? pp.playerName : owner.toString(), false),
                                 pearlId, stored.x, stored.y, stored.z);
                         publishPearlState(owner, pp.playerName, pearlId, eval, stored);
                     }
@@ -616,6 +617,15 @@ public class HydraIntegration extends Module {
             playerObj.addProperty("uuid", uuid.toString());
             playerObj.addProperty("name", pp.playerName != null ? pp.playerName : "");
             playerObj.addProperty("pearlCount", pp.pearls.size());
+            // Secret accounts: name is already the codename; flag it + carry the
+            // Hydra user so the C2 renders "*codename* [hydraUser]".
+            if (PearlPlusPlugin.LEDGER.isSecret(uuid)) {
+                HydraLedger.LedgerEntry le = PearlPlusPlugin.LEDGER.get(uuid);
+                playerObj.addProperty("secret", true);
+                if (le != null && le.hydraUser() != null) {
+                    playerObj.addProperty("hydraUser", le.hydraUser());
+                }
+            }
 
             com.google.gson.JsonArray pearlIds = new com.google.gson.JsonArray();
             com.google.gson.JsonObject pearlStates = new com.google.gson.JsonObject();
@@ -690,11 +700,14 @@ public class HydraIntegration extends Module {
             String uuidStr = userObj.has("uuid") ? userObj.get("uuid").getAsString() : null;
             String name = userObj.has("name") ? userObj.get("name").getAsString() : "";
             String rank = userObj.has("rank") ? userObj.get("rank").getAsString() : "";
+            // Optional, backward-compatible: absent on old C2 payloads → not secret.
+            boolean secret = userObj.has("secret") && userObj.get("secret").getAsBoolean();
+            String hydraUser = userObj.has("hydraUser") ? userObj.get("hydraUser").getAsString() : "";
 
             if (uuidStr == null || uuidStr.isBlank()) continue;
             try {
                 UUID uuid = UUID.fromString(uuidStr);
-                entries.add(new HydraLedger.LedgerEntry(uuid, name, rank));
+                entries.add(new HydraLedger.LedgerEntry(uuid, name, rank, secret, hydraUser));
             } catch (IllegalArgumentException e) {
                 LOG.warn("[Hydra] Skipping invalid UUID in ledger: {}", uuidStr);
             }
@@ -833,6 +846,13 @@ public class HydraIntegration extends Module {
             playerObj.addProperty("name", pp.playerName != null ? pp.playerName : "");
             playerObj.addProperty("expected", playerExpected);
             playerObj.addProperty("present", playerPresent);
+            if (PearlPlusPlugin.LEDGER.isSecret(uuid)) {
+                HydraLedger.LedgerEntry le = PearlPlusPlugin.LEDGER.get(uuid);
+                playerObj.addProperty("secret", true);
+                if (le != null && le.hydraUser() != null) {
+                    playerObj.addProperty("hydraUser", le.hydraUser());
+                }
+            }
             playersArr.add(playerObj);
         }
 
