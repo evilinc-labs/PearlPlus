@@ -274,10 +274,11 @@ public class AutoDetectModule extends Module {
 
             // Hydra authorization check: reject pearls from users not in the ledger.
             // In standalone mode (no ledger received), all users pass.
-            if (!LEDGER.isAuthorized(tracked.owner().uuid())) {
+            // ZenithProxy friends are always treated as authorized regardless of ledger state.
+            if (!LEDGER.isAuthorized(tracked.owner().uuid()) && !isZenithFriend(tracked.owner().uuid())) {
                 if (!tracked.unauthorizedLogged()) {
                     info(String.format(
-                            "Ignoring pearl from unauthorized user %s — not in Hydra ledger",
+                            "Ignoring pearl from unauthorized user %s — not in Hydra ledger or friends list",
                             tracked.ownerSummary()
                     ));
                     tracked.markUnauthorizedLogged();
@@ -487,10 +488,15 @@ public class AutoDetectModule extends Module {
     }
 
     private Optional<OwnerInfo> resolveOwnerInfo(Entity pearl, Map<Integer, Entity> entities) {
-        // Only register pearls with a verified thrower from ProjectileData.
-        // Pearls loaded from chunks (no ProjectileData) are silently ignored —
-        // they will be picked up if re-thrown by a known player.
-        return resolveOwnerFromProjectileOwner(pearl, entities);
+        Optional<OwnerInfo> result = resolveOwnerFromProjectileOwner(pearl, entities);
+        if (result.isPresent()) return result;
+        // Fall back to closest-player heuristic when distanceCheck is enabled.
+        // This covers cases where the thrower's entity is not in the cache
+        // (e.g. threw from outside render distance, or entity despawned before scan).
+        if (PLUGIN_CONFIG.autoDetect.distanceCheck) {
+            return resolveOwnerFromClosestPlayer(pearl, entities);
+        }
+        return Optional.empty();
     }
 
     private Optional<OwnerInfo> resolveOwnerFromProjectileOwner(Entity pearl, Map<Integer, Entity> entities) {
@@ -558,6 +564,13 @@ public class AutoDetectModule extends Module {
             return Optional.empty();
         }
         return Optional.of(new OwnerInfo(ownerUuid, ownerName));
+    }
+
+    private boolean isZenithFriend(UUID uuid) {
+        if (uuid == null || CONFIG == null) return false;
+        var friends = CONFIG.client.extra.friendsList;
+        if (friends == null || friends.isEmpty()) return false;
+        return friends.stream().anyMatch(f -> uuid.equals(f.getUuid()));
     }
 
     private Optional<String> resolveOwnerName(UUID ownerUuid) {

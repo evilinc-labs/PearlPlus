@@ -36,7 +36,8 @@ public class AutoLoadModule extends Module {
         UUID uuid = sender.getProfileId();
 
         // Hydra authorization: completely ignore whispers from non-Hydra users.
-        if (!LEDGER.isAuthorized(uuid)) {
+        // ZenithProxy friends are always treated as authorized regardless of ledger state.
+        if (!LEDGER.isAuthorized(uuid) && !isZenithFriend(uuid)) {
             return;
         }
 
@@ -45,9 +46,12 @@ public class AutoLoadModule extends Module {
         String[] lowerParts = msg.split("\\s+");
         String[] parts = rawMessage.trim().split("\\s+");
 
-        // Check whitelist for load commands
+        // Check whitelist for load commands.
+        // ZenithProxy friends bypass the PearlPlus whitelist even when it is enabled.
         if (msg.startsWith("load")) {
-            if (PLUGIN_CONFIG.autoLoad.whitelistEnabled && !PLUGIN_CONFIG.whitelist.containsKey(uuid)) {
+            if (PLUGIN_CONFIG.autoLoad.whitelistEnabled
+                    && !PLUGIN_CONFIG.whitelist.containsKey(uuid)
+                    && !isZenithFriend(uuid)) {
                 // Non-whitelisted player trying to load - ignore silently
                 return;
             }
@@ -179,5 +183,12 @@ public class AutoLoadModule extends Module {
 
         pearlManager.loadPearl(pearl, name);
         
+    }
+
+    private boolean isZenithFriend(UUID uuid) {
+        if (uuid == null || CONFIG == null) return false;
+        var friends = CONFIG.client.extra.friendsList;
+        if (friends == null || friends.isEmpty()) return false;
+        return friends.stream().anyMatch(f -> uuid.equals(f.getUuid()));
     }
 }
