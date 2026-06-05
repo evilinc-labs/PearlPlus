@@ -32,12 +32,34 @@ public class PearlManager {
     private final Module notifier;
 
     // Tracks pearl columns currently being loaded by the bot.
-    // Checked by AutoDetectModule to distinguish bot loads from external pops.
-    private static final Set<String> loadingColumns = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // Maps column key ("x,z") -> expiry timestamp (ms). Two-phase lifecycle:
+    //   1. On load start:       expiry = now + NAVIGATION_TIMEOUT  (covers Baritone pathfinding)
+    //   2. On right-click sent: expiry = now + POST_CLICK_GRACE    (covers server processing + EntityDestroy latency)
+    // This prevents two bugs:
+    //   a) Race condition: executed listener fires when the right-click packet is SENT, but the
+    //      server's EntityDestroy packet may arrive seconds/minutes later on laggy servers like
+    //      2b2t — without a grace period that gap triggers a false "POPPED EXTERNALLY" alert.
+    //   b) Stuck entry: when Baritone fails/is cancelled, onLostControl() calls future.complete(false)
+    //      but never fires notifyListeners(), so the old Set entry would leak forever and mask
+    //      genuine future external pops as successful bot loads.
+    private static final java.util.concurrent.ConcurrentHashMap<String, Long> loadingColumns =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Max time to wait for Baritone to navigate and right-click the trapdoor (ms). */
+    private static final long NAVIGATION_TIMEOUT_MS  = 10 * 60 * 1_000L; // 10 min
+    /** Grace period after the right-click packet is sent, to absorb server-side
+     *  processing + EntityDestroy network latency before dropping the marker (ms). */
+    private static final long POST_CLICK_GRACE_MS    = 90 * 1_000L;       // 90 s
 
     /** Returns true if a pearl at (x, z) is currently being loaded by the bot. */
     public static boolean isLoadInProgress(int x, int z) {
-        return loadingColumns.contains(x + "," + z);
+        String key = x + "," + z;
+        Long expiry = loadingColumns.get(key);
+        if (expiry == null) return false;
+        if (System.currentTimeMillis() >= expiry) {
+            loadingColumns.remove(key);
+            return false;
+        }
+        return true;
     }
 
     public PearlManager(Module notifier) {
@@ -245,10 +267,15 @@ public class PearlManager {
         int targetY = findTrapdoorY(pearl);
         BlockPos current = CACHE.getPlayerCache().getThePlayer().blockPos();
         String colKey = pearl.x + "," + pearl.z;
-        loadingColumns.add(colKey);
+        loadingColumns.put(colKey, System.currentTimeMillis() + NAVIGATION_TIMEOUT_MS);
         BARITONE.rightClickBlock(pearl.x, targetY, pearl.z)
                 .addExecutedListener(f -> {
-                    loadingColumns.remove(colKey);
+                    // Right-click packet sent. Extend the marker rather than removing it — the
+                    // server still needs to process the trapdoor activation, teleport the player,
+                    // and send an EntityDestroy packet back. On 2b2t this can take 30–90 seconds.
+                    // Without this grace window, AutoDetectModule sees the entity gone while
+                    // isLoadInProgress() is already false and incorrectly fires a "POPPED EXTERNALLY" alert.
+                    loadingColumns.put(colKey, System.currentTimeMillis() + POST_CLICK_GRACE_MS);
                     var builder = Embed.builder()
                             .title("Pearl Loaded!")
                             .addField("Pearl ID", pearl.pearlId, false)
