@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# deploy-to-c2.sh — PearlPlus
+# deploy-to-hydra.sh — PearlPlus
 # ============================================================================
 #
 # Builds the PearlPlus plugin JAR, uploads it to the VPS, and drops it into
@@ -29,12 +29,12 @@ set -euo pipefail
 #
 # ── Usage ──────────────────────────────────────────────────────────────────
 #
-#   ./deploy-to-c2.sh              # build + stage
-#   SKIP_BUILD=1 ./deploy-to-c2.sh # stage existing JAR (skip gradle)
+#   ./deploy-to-hydra.sh              # build + stage
+#   SKIP_BUILD=1 ./deploy-to-hydra.sh # stage existing JAR (skip gradle)
 #
 # ── .env file ──────────────────────────────────────────────────────────────
 #
-# Create .env.deploy-c2 in this repo root (gitignored).
+# Create .env.deploy-hydra in this repo root (gitignored).
 # Required keys:
 #
 #   SSH_USER=<your-ssh-user>
@@ -45,7 +45,7 @@ set -euo pipefail
 # ============================================================================
 
 # Load env
-ENV_FILE="${ENV_FILE:-.env.deploy-c2}"
+ENV_FILE="${ENV_FILE:-.env.deploy-hydra}"
 if [[ -f "$ENV_FILE" ]]; then
   set -o allexport
   source "$ENV_FILE"
@@ -64,7 +64,7 @@ PLUGIN_PREFIX="${PLUGIN_PREFIX:-PearlPlus}"
 LOCAL_JAR_DIR="${LOCAL_JAR_DIR:-build/libs}"
 
 err()  { echo "ERROR: $*" >&2; exit 1; }
-info() { echo "[deploy-to-c2] $*"; }
+info() { echo "[deploy-to-hydra] $*"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

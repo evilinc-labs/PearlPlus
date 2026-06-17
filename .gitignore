@@ -41,7 +41,7 @@ build
 /bin/
 
 .env
-.env.deploy-c2
+.env.deploy-hydra
 
 .claude
 CLAUDE.md
